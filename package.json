@@ -1,0 +1,15 @@
+{
+  "name": "smart-educational-compiler-runner",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Root runner scripts for backend + frontend",
+  "scripts": {
+    "start": "concurrently \"python web_api_1.py\" \"npm --prefix frontend run dev\"",
+    "start:backend": "python web_api_1.py",
+    "start:frontend": "npm --prefix frontend run dev",
+    "install:all": "pip install -r requirements.txt && npm --prefix frontend install"
+  },
+  "devDependencies": {
+    "concurrently": "^9.2.1"
+  }
+}
