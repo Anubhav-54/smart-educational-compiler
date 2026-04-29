@@ -1,0 +1,27 @@
+{
+  "1_hello_world": {
+    "success": true,
+    "syntax_errors": [],
+    "semantic_errors": []
+  },
+  "2_input_output": {
+    "success": true,
+    "syntax_errors": [],
+    "semantic_errors": []
+  },
+  "3_if_else": {
+    "success": true,
+    "syntax_errors": [],
+    "semantic_errors": []
+  },
+  "4_loop": {
+    "success": true,
+    "syntax_errors": [],
+    "semantic_errors": []
+  },
+  "5_functions": {
+    "success": true,
+    "syntax_errors": [],
+    "semantic_errors": []
+  }
+}

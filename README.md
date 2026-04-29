@@ -41,7 +41,11 @@ This project implements a comprehensive Web-Based Smart Educational Compiler for
 │   │   └── ...
 │   ├── package.json     # Node.js dependencies
 │   └── ...
-
+└── documentation/       # PBL submission documents
+    ├── PROJECT_ABSTRACT.md
+    ├── PHASE_2_REPORT.md
+    └── ...
+```
 
 ## Quick Start
 

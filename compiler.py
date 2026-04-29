@@ -1,6 +1,6 @@
 import re
 from enum import Enum
-from collections import defaultdict
+from collections import defaultdict, deque
 from typing import List, Tuple, Dict, Optional
 import json
 
@@ -12,10 +12,13 @@ class TokenType(Enum):
     IF = "IF"
     ELSE = "ELSE"
     WHILE = "WHILE"
+    FOR = "FOR"
     RETURN = "RETURN"
     VOID = "VOID"
     
     # Operators
+    INC = "INC"
+    DEC = "DEC"
     ASSIGN = "ASSIGN"
     PLUS = "PLUS"
     MINUS = "MINUS"
@@ -44,6 +47,8 @@ class TokenType(Enum):
     ID = "ID"
     NUMBER = "NUMBER"
     FLOATNUM = "FLOATNUM"
+    STRING = "STRING"
+    AMPERSAND = "AMPERSAND"
     
     # Special
     EOF = "EOF"
@@ -67,22 +72,28 @@ class Lexer:
         'if': TokenType.IF,
         'else': TokenType.ELSE,
         'while': TokenType.WHILE,
+        'for': TokenType.FOR,
         'return': TokenType.RETURN,
         'void': TokenType.VOID,
     }
     
     TOKEN_SPEC = [
-        ('COMMENT',   r'//.*'),
-        ('FLOATNUM',  r'\d+\.\d+'),
-        ('NUMBER',    r'\d+'),
-        ('ID',        r'[A-Za-z_][A-Za-z0-9_]*'),
-        ('EQ',        r'=='),
-        ('NE',        r'!='),
-        ('LE',        r'<='),
-        ('GE',        r'>='),
-        ('AND',       r'&&'),
-        ('OR',        r'\|\|'),
-        ('ASSIGN',    r'='),
+        ('COMMENT',      r'//.*'),
+        ('PREPROCESSOR', r'#.*'),
+        ('STRING',       r'"([^"\\]|\\.)*"'),
+        ('FLOATNUM',     r'\d+\.\d+'),
+        ('NUMBER',       r'\d+'),
+        ('ID',           r'[A-Za-z_][A-Za-z0-9_]*'),
+        ('EQ',           r'=='),
+        ('NE',           r'!='),
+        ('LE',           r'<='),
+        ('GE',           r'>='),
+        ('AND',          r'&&'),
+        ('OR',           r'\|\|'),
+        ('INC',          r'\+\+'),
+        ('DEC',          r'--'),
+        ('AMPERSAND',    r'&'),
+        ('ASSIGN',       r'='),
         ('LT',        r'<'),
         ('GT',        r'>'),
         ('PLUS',      r'\+'),
@@ -123,7 +134,7 @@ class Lexer:
             if kind == 'NEWLINE':
                 line_num += 1
                 line_start = mo.end()
-            elif kind == 'SKIP' or kind == 'COMMENT':
+            elif kind in ['SKIP', 'COMMENT', 'PREPROCESSOR']:
                 continue
             elif kind == 'MISMATCH':
                 self.errors.append({
@@ -183,12 +194,27 @@ class ErrorHandler:
             if stripped and not stripped.endswith(';') and not stripped.endswith('{') and not stripped.endswith('}'):
                 if any(keyword in stripped for keyword in ['=', 'return']):
                     corrections.append((i, f"Missing semicolon at end of line {i}"))
-            
-            # Check for unclosed brackets
-            if stripped.count('(') > stripped.count(')'):
-                corrections.append((i, f"Unclosed parenthesis '(' at line {i}"))
-            if stripped.count('{') > stripped.count('}'):
-                corrections.append((i, f"Unclosed brace '{{' at line {i}"))
+
+        # Check for truly unclosed brackets across the full program.
+        open_paren_lines = []
+        open_brace_lines = []
+        for i, line in enumerate(lines, 1):
+            for ch in line:
+                if ch == '(':
+                    open_paren_lines.append(i)
+                elif ch == ')':
+                    if open_paren_lines:
+                        open_paren_lines.pop()
+                elif ch == '{':
+                    open_brace_lines.append(i)
+                elif ch == '}':
+                    if open_brace_lines:
+                        open_brace_lines.pop()
+
+        for line_no in open_paren_lines:
+            corrections.append((line_no, f"Unclosed parenthesis '(' at line {line_no}"))
+        for line_no in open_brace_lines:
+            corrections.append((line_no, f"Unclosed brace '{{' at line {line_no}"))
         
         # Add correction hints based on actual semantic/syntax errors
         for error in errors or []:
@@ -253,9 +279,10 @@ class Program(ASTNode):
         self.statements = statements
 
 class Declaration(ASTNode):
-    def __init__(self, type_, name):
+    def __init__(self, type_, name, initializer=None):
         self.type = type_
         self.name = name
+        self.initializer = initializer
 
 class Assignment(ASTNode):
     def __init__(self, name, expression):
@@ -281,6 +308,26 @@ class Identifier(ASTNode):
     def __init__(self, name):
         self.name = name
 
+class StringLiteral(ASTNode):
+    def __init__(self, value):
+        self.value = value
+
+class AddressOf(ASTNode):
+    def __init__(self, target):
+        self.target = target
+
+class FunctionCall(ASTNode):
+    def __init__(self, name, args=None):
+        self.name = name
+        self.args = args or []
+
+class FunctionDefinition(ASTNode):
+    def __init__(self, return_type, name, params, body):
+        self.return_type = return_type
+        self.name = name
+        self.params = params
+        self.body = body
+
 class IfStatement(ASTNode):
     def __init__(self, condition, then_stmt, else_stmt=None):
         self.condition = condition
@@ -290,6 +337,13 @@ class IfStatement(ASTNode):
 class WhileStatement(ASTNode):
     def __init__(self, condition, body):
         self.condition = condition
+        self.body = body
+
+class ForStatement(ASTNode):
+    def __init__(self, init, condition, update, body):
+        self.init = init
+        self.condition = condition
+        self.update = update
         self.body = body
 
 class ReturnStatement(ASTNode):
@@ -362,10 +416,15 @@ class Parser:
             if len(self.errors) >= self.max_errors:
                 break
             before_pos = self.pos
-            if self.current_token().type in [TokenType.INT, TokenType.FLOAT]:
-                decl = self.parse_declaration()
-                if decl:
-                    declarations.append(decl)
+            if self.current_token().type in [TokenType.INT, TokenType.FLOAT, TokenType.VOID]:
+                if self.peek_token().type == TokenType.ID and self.peek_token(2).type == TokenType.LPAREN:
+                    func = self.parse_function_definition()
+                    if func:
+                        statements.append(func)
+                else:
+                    decls = self.parse_declaration()
+                    if decls:
+                        declarations.extend(decls)
             else:
                 stmt = self.parse_statement()
                 if stmt:
@@ -375,24 +434,38 @@ class Parser:
         
         return Program(declarations, statements)
     
-    def parse_declaration(self) -> Optional[Declaration]:
+    def parse_declaration(self) -> Optional[List[Declaration]]:
         type_token = self.current_token()
         type_name = type_token.value
         self.advance()
         
-        if self.current_token().type != TokenType.ID:
-            self.report_error({
-                'type': 'SYNTAX_ERROR',
-                'line': type_token.line,
-                'message': 'Expected identifier after type',
-                'phase': 'Syntax Analysis'
-            })
-            self.synchronize()
-            return None
-        
-        name = self.current_token().value
-        name_line = self.current_token().line
-        self.advance()
+        declarations = []
+        while True:
+            if self.current_token().type != TokenType.ID:
+                self.report_error({
+                    'type': 'SYNTAX_ERROR',
+                    'line': type_token.line,
+                    'message': 'Expected identifier after type',
+                    'phase': 'Syntax Analysis'
+                })
+                self.synchronize()
+                return None
+            
+            name = self.current_token().value
+            name_line = self.current_token().line
+            self.advance()
+
+            initializer = None
+            if self.current_token().type == TokenType.ASSIGN:
+                self.advance()
+                initializer = self.parse_expression()
+
+            declarations.append(Declaration(type_name, name, initializer))
+
+            if self.current_token().type == TokenType.COMMA:
+                self.advance()
+                continue
+            break
         
         if self.current_token().type == TokenType.SEMICOLON:
             self.advance()
@@ -404,30 +477,57 @@ class Parser:
                 'message': 'Missing semicolon',
                 'phase': 'Syntax Analysis'
             })
+
+        for declaration in declarations:
+            success, error = self.symbol_table.declare(declaration.name, declaration.type, declaration.initializer.line if hasattr(declaration.initializer, 'line') else name_line)
+            if not success:
+                self.report_error({
+                    'type': 'SEMANTIC_ERROR',
+                    'line': name_line,
+                    'message': error,
+                    'phase': 'Semantic Analysis'
+                })
         
-        # Register in symbol table
-        success, error = self.symbol_table.declare(name, type_name, name_line)
-        if not success:
-            self.report_error({
-                'type': 'SEMANTIC_ERROR',
-                'line': name_line,
-                'message': error,
-                'phase': 'Semantic Analysis'
-            })
-        
-        return Declaration(type_name, name)
+        return declarations
     
     def parse_statement(self):
         token = self.current_token()
         
-        if token.type == TokenType.ID:
+        if token.type in [TokenType.INT, TokenType.FLOAT, TokenType.VOID]:
+            if self.peek_token().type == TokenType.ID:
+                if self.peek_token(2).type == TokenType.LPAREN:
+                    return self.parse_function_definition()
+                else:
+                    decls = self.parse_declaration()
+                    if decls:
+                        return decls
+                    else:
+                        self.synchronize()
+                        return None
+            else:
+                self.report_error({
+                    'type': 'SYNTAX_ERROR',
+                    'line': token.line,
+                    'message': 'Expected identifier after type',
+                    'phase': 'Syntax Analysis'
+                })
+                self.synchronize()
+                return None
+        elif token.type == TokenType.ID:
+            if self.peek_token().type == TokenType.LPAREN:
+                return self.parse_function_call()
             return self.parse_assignment()
         elif token.type == TokenType.IF:
             return self.parse_if_statement()
         elif token.type == TokenType.WHILE:
             return self.parse_while_statement()
+        elif token.type == TokenType.FOR:
+            return self.parse_for_statement()
         elif token.type == TokenType.RETURN:
             return self.parse_return_statement()
+        elif token.type == TokenType.SEMICOLON:
+            self.advance()
+            return None
         elif token.type == TokenType.LBRACE:
             return self.parse_block()
         else:
@@ -440,39 +540,136 @@ class Parser:
             self.synchronize()
             return None
     
-    def parse_assignment(self) -> Optional[Assignment]:
+    def parse_assignment_expr(self):
         name_token = self.current_token()
         name = name_token.value
         self.advance()
         
-        if not self.expect(TokenType.ASSIGN):
-            return None
-        
-        expr = self.parse_expression()
+        if self.current_token().type == TokenType.INC:
+            self.advance()
+            return Assignment(name, BinaryOp(Identifier(name), '+', Number(1)))
+        elif self.current_token().type == TokenType.DEC:
+            self.advance()
+            return Assignment(name, BinaryOp(Identifier(name), '-', Number(1)))
+        elif self.current_token().type == TokenType.ASSIGN:
+            self.advance()
+            val = self.parse_expression()
+            return Assignment(name, val)
+        elif self.current_token().type in [TokenType.PLUS, TokenType.MINUS, TokenType.MULT, TokenType.DIV, TokenType.MOD]:
+            op = self.current_token().value
+            self.advance()
+            if self.current_token().type == TokenType.ASSIGN:
+                self.advance()
+                val = self.parse_expression()
+                return Assignment(name, BinaryOp(Identifier(name), op, val))
+                
+        self.report_error({
+            'type': 'SYNTAX_ERROR',
+            'line': name_token.line,
+            'message': 'Expected =, ++, -- or compound assignment',
+            'phase': 'Syntax Analysis'
+        })
+        return None
+
+    def parse_assignment(self) -> Optional[Assignment]:
+        expr = self.parse_assignment_expr()
+        if not expr: return None
         
         if self.current_token().type == TokenType.SEMICOLON:
             self.advance()
         else:
             self.report_error({
                 'type': 'SYNTAX_ERROR',
-                'line': name_token.line,
+                'line': self.current_token().line,
                 'column': self.current_token().column,
                 'message': 'Missing semicolon',
                 'phase': 'Syntax Analysis'
             })
         
-        # Check if variable is declared
-        var_type = self.symbol_table.lookup(name)
+        var_type = self.symbol_table.lookup(expr.name)
         if var_type is None:
             self.report_error({
                 'type': 'SEMANTIC_ERROR',
-                'line': name_token.line,
-                'message': f"Undeclared variable '{name}'",
+                'line': self.current_token().line,
+                'message': f"Undeclared variable '{expr.name}'",
                 'phase': 'Semantic Analysis',
-                'suggestion': f"Declare variable: int {name};"
+                'suggestion': f"Declare variable: int {expr.name};"
             })
         
-        return Assignment(name, expr)
+        return expr
+    
+    def parse_function_call(self) -> Optional[FunctionCall]:
+        name_token = self.current_token()
+        name = name_token.value
+        self.advance()
+        self.expect(TokenType.LPAREN)
+
+        args = []
+        if self.current_token().type != TokenType.RPAREN:
+            args.append(self.parse_expression())
+            while self.current_token().type == TokenType.COMMA:
+                self.advance()
+                args.append(self.parse_expression())
+
+        self.expect(TokenType.RPAREN)
+        if self.current_token().type == TokenType.SEMICOLON:
+            self.advance()
+        else:
+            self.report_error({
+                'type': 'SYNTAX_ERROR',
+                'line': self.current_token().line,
+                'column': self.current_token().column,
+                'message': 'Missing semicolon',
+                'phase': 'Syntax Analysis'
+            })
+        
+        return FunctionCall(name, args)
+    
+    def parse_function_definition(self) -> Optional[FunctionDefinition]:
+        type_token = self.current_token()
+        return_type = type_token.value
+        self.advance()
+
+        if self.current_token().type != TokenType.ID:
+            self.report_error({
+                'type': 'SYNTAX_ERROR',
+                'line': type_token.line,
+                'message': 'Expected function name after return type',
+                'phase': 'Syntax Analysis'
+            })
+            self.synchronize()
+            return None
+
+        name = self.current_token().value
+        self.advance()
+        self.expect(TokenType.LPAREN)
+
+        params = []
+        if self.current_token().type != TokenType.RPAREN:
+            while True:
+                if self.current_token().type in [TokenType.INT, TokenType.FLOAT, TokenType.VOID] and self.peek_token().type == TokenType.ID:
+                    param_type = self.current_token().value
+                    self.advance()
+                    param_name = self.current_token().value
+                    self.advance()
+                    params.append((param_type, param_name))
+                else:
+                    self.report_error({
+                        'type': 'SYNTAX_ERROR',
+                        'line': self.current_token().line,
+                        'message': 'Invalid function parameter',
+                        'phase': 'Syntax Analysis'
+                    })
+                    break
+
+                if self.current_token().type == TokenType.COMMA:
+                    self.advance()
+                    continue
+                break
+
+        self.expect(TokenType.RPAREN)
+        body = self.parse_block()
+        return FunctionDefinition(return_type, name, params, body)
     
     def parse_expression(self):
         return self.parse_or_expression()
@@ -538,6 +735,10 @@ class Parser:
             self.advance()
             expr = self.parse_unary_expression()
             return UnaryOp(op_token.value, expr)
+        elif self.current_token().type == TokenType.AMPERSAND:
+            self.advance()
+            target = self.parse_primary_expression()
+            return AddressOf(target)
         
         return self.parse_primary_expression()
     
@@ -550,9 +751,22 @@ class Parser:
         elif token.type == TokenType.FLOATNUM:
             self.advance()
             return Number(float(token.value))
+        elif token.type == TokenType.STRING:
+            self.advance()
+            return StringLiteral(token.value[1:-1])
         elif token.type == TokenType.ID:
             name = token.value
             self.advance()
+            if self.current_token().type == TokenType.LPAREN:
+                self.advance()
+                args = []
+                if self.current_token().type != TokenType.RPAREN:
+                    args.append(self.parse_expression())
+                    while self.current_token().type == TokenType.COMMA:
+                        self.advance()
+                        args.append(self.parse_expression())
+                self.expect(TokenType.RPAREN)
+                return FunctionCall(name, args)
             return Identifier(name)
         elif token.type == TokenType.LPAREN:
             self.advance()
@@ -592,6 +806,30 @@ class Parser:
         
         body = self.parse_statement()
         return WhileStatement(condition, body)
+
+    def parse_for_statement(self) -> Optional[ForStatement]:
+        self.advance()  # skip 'for'
+        self.expect(TokenType.LPAREN)
+        
+        init = None
+        if self.current_token().type != TokenType.SEMICOLON:
+            init = self.parse_assignment()
+        else:
+            self.advance()
+            
+        condition = None
+        if self.current_token().type != TokenType.SEMICOLON:
+            condition = self.parse_expression()
+        self.expect(TokenType.SEMICOLON)
+        
+        update = None
+        if self.current_token().type != TokenType.RPAREN:
+            update = self.parse_assignment_expr()
+            
+        self.expect(TokenType.RPAREN)
+        body = self.parse_statement()
+        
+        return ForStatement(init, condition, update, body)
     
     def parse_return_statement(self) -> Optional[ReturnStatement]:
         self.advance()  # skip 'return'
@@ -609,7 +847,10 @@ class Parser:
         while self.current_token().type != TokenType.RBRACE and self.current_token().type != TokenType.EOF:
             stmt = self.parse_statement()
             if stmt:
-                statements.append(stmt)
+                if isinstance(stmt, list):
+                    statements.extend(stmt)
+                else:
+                    statements.append(stmt)
         
         self.symbol_table.exit_scope()
         self.expect(TokenType.RBRACE)
@@ -620,11 +861,17 @@ class IntermediateCodeGenerator:
     def __init__(self):
         self.tac = []
         self.temp_counter = 0
+        self.label_counter = 0
     
     def new_temp(self) -> str:
         temp = f"t{self.temp_counter}"
         self.temp_counter += 1
         return temp
+    
+    def new_label(self) -> str:
+        label = f"L{self.label_counter}"
+        self.label_counter += 1
+        return label
     
     def emit(self, op: str, arg1: str = "", arg2: str = "", result: str = ""):
         """Emit a Three Address Code instruction"""
@@ -635,19 +882,75 @@ class IntermediateCodeGenerator:
             'result': result
         })
     
-    def generate(self, ast: ASTNode) -> List[Dict]:
+    def generate(self, ast: ASTNode) -> List[Dict] | str:
         """Generate TAC from AST"""
         if isinstance(ast, Program):
             for stmt in ast.statements:
                 self.generate(stmt)
+        elif isinstance(ast, Declaration):
+            if ast.initializer:
+                self.generate_assignment(Assignment(ast.name, ast.initializer))
         elif isinstance(ast, Assignment):
             self.generate_assignment(ast)
+        elif isinstance(ast, FunctionDefinition):
+            self.emit("LABEL", "", "", ast.name)
+            for stmt in ast.body:
+                self.generate(stmt)
+        elif isinstance(ast, FunctionCall):
+            args = [str(self.generate(arg)) for arg in ast.args]
+            result = self.new_temp()
+            self.emit("CALL", ast.name, ", ".join(args), result)
+            return result
+        elif isinstance(ast, IfStatement):
+            else_label = self.new_label()
+            end_label = self.new_label()
+            cond = self.generate(ast.condition)
+            self.emit("JZ", cond, "", else_label)
+            self.generate(ast.then_stmt)
+            self.emit("JMP", "", "", end_label)
+            self.emit("LABEL", "", "", else_label)
+            if ast.else_stmt:
+                self.generate(ast.else_stmt)
+            self.emit("LABEL", "", "", end_label)
+        elif isinstance(ast, WhileStatement):
+            start_label = self.new_label()
+            end_label = self.new_label()
+            self.emit("LABEL", "", "", start_label)
+            cond = self.generate(ast.condition)
+            self.emit("JZ", cond, "", end_label)
+            self.generate(ast.body)
+            self.emit("JMP", "", "", start_label)
+            self.emit("LABEL", "", "", end_label)
+        elif isinstance(ast, ForStatement):
+            if ast.init:
+                self.generate(ast.init)
+            start_label = self.new_label()
+            end_label = self.new_label()
+            self.emit("LABEL", "", "", start_label)
+            if ast.condition:
+                cond = self.generate(ast.condition)
+                self.emit("JZ", cond, "", end_label)
+            self.generate(ast.body)
+            if ast.update:
+                self.generate(ast.update)
+            self.emit("JMP", "", "", start_label)
+            self.emit("LABEL", "", "", end_label)
+        elif isinstance(ast, ReturnStatement):
+            value = self.generate(ast.expression) if ast.expression else "0"
+            self.emit("RETURN", value, "", "")
         elif isinstance(ast, BinaryOp):
             return self.generate_binary_op(ast)
+        elif isinstance(ast, StringLiteral):
+            return ast.value
+        elif isinstance(ast, AddressOf):
+            return ast.target.name if isinstance(ast.target, Identifier) else str(ast.target)
         elif isinstance(ast, Number):
             return str(ast.value)
         elif isinstance(ast, Identifier):
             return ast.name
+        elif isinstance(ast, list):
+            for stmt in ast:
+                self.generate(stmt)
         
         return self.tac
     
@@ -710,10 +1013,343 @@ def ast_to_dict(node) -> Dict:
             'type': 'Identifier',
             'name': node.name
         }
+    elif isinstance(node, StringLiteral):
+        return {
+            'type': 'StringLiteral',
+            'value': node.value
+        }
+    elif isinstance(node, AddressOf):
+        return {
+            'type': 'AddressOf',
+            'target': ast_to_dict(node.target)
+        }
+    elif isinstance(node, FunctionCall):
+        return {
+            'type': 'FunctionCall',
+            'name': node.name,
+            'args': [ast_to_dict(arg) for arg in node.args]
+        }
+    elif isinstance(node, FunctionDefinition):
+        return {
+            'type': 'FunctionDefinition',
+            'returnType': node.return_type,
+            'name': node.name,
+            'params': [{'type': p[0], 'name': p[1]} for p in node.params],
+            'body': [ast_to_dict(stmt) for stmt in node.body]
+        }
+    elif isinstance(node, IfStatement):
+        return {
+            'type': 'IfStatement',
+            'condition': ast_to_dict(node.condition),
+            'then': ast_to_dict(node.then_stmt),
+            'else': ast_to_dict(node.else_stmt) if node.else_stmt else None
+        }
+    elif isinstance(node, WhileStatement):
+        return {
+            'type': 'WhileStatement',
+            'condition': ast_to_dict(node.condition),
+            'body': ast_to_dict(node.body)
+        }
+    elif isinstance(node, ForStatement):
+        return {
+            'type': 'ForStatement',
+            'init': ast_to_dict(node.init),
+            'condition': ast_to_dict(node.condition),
+            'update': ast_to_dict(node.update),
+            'body': ast_to_dict(node.body)
+        }
+    elif isinstance(node, ReturnStatement):
+        return {
+            'type': 'ReturnStatement',
+            'expression': ast_to_dict(node.expression)
+        }
     elif isinstance(node, list):
         return [ast_to_dict(item) for item in node]
-    
+
     return str(node)
+
+# ==================== INTERPRETER ====================
+class Interpreter:
+    def __init__(self, input_values=None):
+        self.env_stack = [{}]
+        self.output = []
+        self.inputs = deque(input_values or [])
+        self.functions = {}
+    
+    def current_env(self):
+        return self.env_stack[-1]
+    
+    def lookup(self, name: str):
+        for env in reversed(self.env_stack):
+            if name in env:
+                return env[name]
+        return 0
+    
+    def assign(self, name: str, value):
+        for env in reversed(self.env_stack):
+            if name in env:
+                env[name] = value
+                return
+        self.current_env()[name] = value
+    
+    def push_env(self):
+        self.env_stack.append({})
+    
+    def pop_env(self):
+        if len(self.env_stack) > 1:
+            self.env_stack.pop()
+    
+    def extract_input_values(self, code: str):
+        import re
+        match = re.search(r'//\s*input\s*:\s*([0-9\s]+)', code)
+        if match:
+            values = [int(x) for x in match.group(1).split() if x.isdigit()]
+            self.inputs = deque(values)
+        elif not self.inputs:
+            self.inputs = deque([0, 0])
+    
+    def run(self, ast: Program, code: str = "") -> List[str]:
+        if code:
+            self.extract_input_values(code)
+
+        main_func = None
+        for stmt in ast.statements:
+            if isinstance(stmt, FunctionDefinition):
+                self.functions[stmt.name] = stmt
+                if stmt.name == 'main':
+                    main_func = stmt
+            elif isinstance(stmt, Declaration):
+                self.execute(stmt)
+
+        if main_func:
+            self.execute_function(main_func)
+        else:
+            for stmt in ast.statements:
+                if not isinstance(stmt, FunctionDefinition):
+                    self.execute(stmt)
+
+        return self.output
+    
+    def execute_function(self, func: FunctionDefinition, args=None):
+        self.push_env()
+        for (param_type, param_name), arg in zip(func.params, args or []):
+            self.current_env()[param_name] = self.evaluate(arg)
+        result = self.execute_block(func.body)
+        self.pop_env()
+        if isinstance(result, dict) and result.get('return'):
+            return result['value']
+        return 0
+    
+    def execute_block(self, statements):
+        for stmt in statements:
+            result = self.execute(stmt)
+            if isinstance(result, dict) and result.get('return'):
+                return result
+        return None
+    
+    def execute(self, node):
+        if node is None:
+            return None
+        if isinstance(node, Declaration):
+            self.current_env()[node.name] = self.evaluate(node.initializer) if node.initializer else 0
+            return None
+        if isinstance(node, Assignment):
+            value = self.evaluate(node.expression)
+            self.assign(node.name, value)
+            return None
+        if isinstance(node, FunctionCall):
+            return self.execute_function_call(node)
+        if isinstance(node, IfStatement):
+            condition = self.evaluate(node.condition)
+            if condition:
+                return self.execute(node.then_stmt)
+            elif node.else_stmt:
+                return self.execute(node.else_stmt)
+            return None
+        if isinstance(node, WhileStatement):
+            while self.evaluate(node.condition):
+                result = self.execute(node.body)
+                if isinstance(result, dict) and result.get('return'):
+                    return result
+            return None
+        if isinstance(node, ForStatement):
+            if node.init:
+                self.execute(node.init)
+            while node.condition is None or self.evaluate(node.condition):
+                result = self.execute(node.body)
+                if isinstance(result, dict) and result.get('return'):
+                    return result
+                if node.update:
+                    self.execute(node.update)
+            return None
+        if isinstance(node, ReturnStatement):
+            value = self.evaluate(node.expression) if node.expression else 0
+            return {'return': True, 'value': value}
+        if isinstance(node, list):
+            return self.execute_block(node)
+        return None
+    
+    def execute_function_call(self, node: FunctionCall):
+        name = node.name
+        if name == 'printf':
+            formatted = self.format_printf(node.args)
+            self.output.append(formatted)
+            return None
+        if name == 'scanf':
+            self.handle_scanf(node.args)
+            return None
+        func = self.functions.get(name)
+        if func:
+            return self.execute_function(func, node.args)
+        return 0
+    
+    def format_printf(self, args):
+        if not args:
+            return ''
+        fmt = self.evaluate(args[0])
+        values = [self.evaluate(arg) for arg in args[1:]]
+        try:
+            if isinstance(fmt, str):
+                return fmt.replace('%d', '{}').replace('%f', '{}').format(*values)
+        except Exception:
+            pass
+        return f"{fmt} {' '.join(str(v) for v in values)}"
+    
+    def handle_scanf(self, args):
+        if not args:
+            return
+        format_str = self.evaluate(args[0])
+        values = []
+        if isinstance(format_str, str):
+            specifiers = format_str.count('%d') + format_str.count('%f')
+            for _ in range(specifiers):
+                values.append(self.inputs.popleft() if self.inputs else 0)
+        for target, value in zip(args[1:], values):
+            if isinstance(target, AddressOf) and isinstance(target.target, Identifier):
+                self.assign(target.target.name, value)
+    
+    def evaluate(self, node):
+        if node is None:
+            return 0
+        if isinstance(node, Number):
+            return node.value
+        if isinstance(node, StringLiteral):
+            return node.value
+        if isinstance(node, Identifier):
+            return self.lookup(node.name)
+        if isinstance(node, AddressOf):
+            return node.target.name if isinstance(node.target, Identifier) else None
+        if isinstance(node, FunctionCall):
+            return self.execute_function_call(node)
+        if isinstance(node, BinaryOp):
+            left = self.evaluate(node.left)
+            right = self.evaluate(node.right)
+            if node.op == '+':
+                return left + right
+            if node.op == '-':
+                return left - right
+            if node.op == '*':
+                return left * right
+            if node.op == '/':
+                return left // right if isinstance(left, int) and isinstance(right, int) and right != 0 else left / right
+            if node.op == '%':
+                return left % right if isinstance(right, int) and right != 0 else 0
+            if node.op == '==':
+                return left == right
+            if node.op == '!=':
+                return left != right
+            if node.op == '<':
+                return left < right
+            if node.op == '<=':
+                return left <= right
+            if node.op == '>':
+                return left > right
+            if node.op == '>=':
+                return left >= right
+            if node.op == '&&':
+                return bool(left) and bool(right)
+            if node.op == '||':
+                return bool(left) or bool(right)
+        if isinstance(node, UnaryOp):
+            value = self.evaluate(node.operand)
+            if node.op == '-':
+                return -value
+            if node.op == '!':
+                return not bool(value)
+        return 0
+    
+    def format_printf(self, args):
+        if not args:
+            return ''
+        fmt = self.evaluate(args[0])
+        values = [self.evaluate(arg) for arg in args[1:]]
+        try:
+            if isinstance(fmt, str):
+                return fmt.replace('%d', '{}').replace('%f', '{}').format(*values)
+        except Exception:
+            pass
+        return f"{fmt} {' '.join(str(v) for v in values)}"
+    
+    def handle_scanf(self, args):
+        if not args:
+            return
+        format_str = self.evaluate(args[0])
+        values = []
+        if isinstance(format_str, str):
+            specifiers = format_str.count('%d') + format_str.count('%f')
+            for _ in range(specifiers):
+                values.append(self.inputs.popleft() if self.inputs else 0)
+        for target, value in zip(args[1:], values):
+            if isinstance(target, AddressOf) and isinstance(target.target, Identifier):
+                self.assign(target.target.name, value)
+    
+    def evaluate(self, node):
+        if node is None:
+            return 0
+        if isinstance(node, Number):
+            return node.value
+        if isinstance(node, StringLiteral):
+            return node.value
+        if isinstance(node, Identifier):
+            return self.lookup(node.name)
+        if isinstance(node, AddressOf):
+            return node.target.name if isinstance(node.target, Identifier) else None
+        if isinstance(node, BinaryOp):
+            left = self.evaluate(node.left)
+            right = self.evaluate(node.right)
+            if node.op == '+':
+                return left + right
+            if node.op == '-':
+                return left - right
+            if node.op == '*':
+                return left * right
+            if node.op == '/':
+                return left // right if isinstance(left, int) and isinstance(right, int) and right != 0 else left / right
+            if node.op == '%':
+                return left % right if isinstance(right, int) and right != 0 else 0
+            if node.op == '==':
+                return left == right
+            if node.op == '!=':
+                return left != right
+            if node.op == '<':
+                return left < right
+            if node.op == '<=':
+                return left <= right
+            if node.op == '>':
+                return left > right
+            if node.op == '>=':
+                return left >= right
+            if node.op == '&&':
+                return bool(left) and bool(right)
+            if node.op == '||':
+                return bool(left) or bool(right)
+        if isinstance(node, UnaryOp):
+            value = self.evaluate(node.operand)
+            if node.op == '-':
+                return -value
+            if node.op == '!':
+                return not bool(value)
+        return 0
 
 # ==================== MAIN COMPILER ====================
 class SmartCompiler:
@@ -812,9 +1448,12 @@ class SmartCompiler:
                     print(f"  {i}: {instruction['op']} {instruction['arg1']} {instruction['arg2']} -> {instruction['result']}")
             else:
                 print("No intermediate code generated")
+            interpreter = Interpreter()
+            result['compiler_output'] = interpreter.run(ast, code)
         else:
             result['phases']['ast'] = {}
             result['phases']['intermediate_code'] = []
+            result['compiler_output'] = []
             print("\nSkipping AST and intermediate code generation due to earlier errors")
         
         # Auto-correction suggestions
@@ -852,6 +1491,7 @@ class SmartCompiler:
             },
             'errors': normalized_errors
         }
+        result['success'] = total_errors == 0
         
         return result
 
